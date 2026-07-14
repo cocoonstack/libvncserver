@@ -113,6 +113,18 @@ typedef rfbBool (*rfbPasswordCheckProcPtr)(struct _rfbClientRec* cl,const char* 
 typedef enum rfbNewClientAction (*rfbNewClientHookPtr)(struct _rfbClientRec* cl);
 typedef void (*rfbDisplayHookPtr)(struct _rfbClientRec* cl);
 typedef void (*rfbDisplayFinishedHookPtr)(struct _rfbClientRec* cl, int result);
+/**
+ * Return one complete H.264 access unit for a framebuffer update.
+ *
+ * The callback must allocate @p frameBuffer with malloc(). LibVNCServer takes
+ * ownership and frees it after the update has been sent. The callback is
+ * invoked independently for every client, so applications can keep a
+ * per-client stream cursor in clientData. It may block until the next access
+ * unit is available, but must return when the client or server shuts down.
+ */
+typedef rfbBool (*rfbH264EncoderCallbackPtr)(struct _rfbClientRec* cl,
+                                             char** frameBuffer,
+                                             size_t* frameBufferSize);
 /** support the capability to view the caps/num/scroll states of the X server */
 typedef int  (*rfbGetKeyboardLedStateHookPtr)(struct _rfbScreenInfo* screen);
 typedef rfbBool (*rfbXvpHookPtr)(struct _rfbClientRec* cl, uint8_t, uint8_t);
@@ -297,6 +309,8 @@ typedef struct _rfbScreenInfo
      * The buffer will not be freed by
      */
     char* frameBuffer;
+    /** Optional H.264 source for rfbEncodingOpenH264/rfbEncodingH264. */
+    rfbH264EncoderCallbackPtr h264EncoderCallback;
     rfbKbdAddEventProcPtr kbdAddEvent;
     rfbKbdReleaseAllKeysProcPtr kbdReleaseAllKeys;
     rfbPtrAddEventProcPtr ptrAddEvent;
@@ -862,6 +876,7 @@ extern void rfbClientConnFailed(rfbClientPtr cl, const char *reason);
 extern void rfbNewUDPConnection(rfbScreenInfoPtr rfbScreen,rfbSocket sock);
 extern void rfbProcessUDPInput(rfbScreenInfoPtr rfbScreen);
 extern rfbBool rfbSendFramebufferUpdate(rfbClientPtr cl, sraRegionPtr updateRegion);
+extern rfbBool rfbSendRectEncodingH264(rfbClientPtr cl);
 extern rfbBool rfbSendRectEncodingRaw(rfbClientPtr cl, int x,int y,int w,int h);
 extern rfbBool rfbSendUpdateBuf(rfbClientPtr cl);
 extern void rfbSendServerCutText(rfbScreenInfoPtr rfbScreen,char *str, int len);

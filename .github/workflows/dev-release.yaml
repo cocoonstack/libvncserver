@@ -1,0 +1,111 @@
+name: Build and Release Dev
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scrcpy-rfb-dev-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build Ubuntu 22.04 binary
+        run: |
+          docker build \
+            --platform "${{ matrix.platform }}" \
+            -t "scrcpy-rfb-builder:${{ matrix.arch }}" \
+            -f tools/scrcpy-rfb/Dockerfile.builder .
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            -v "$PWD:/src" \
+            "scrcpy-rfb-builder:${{ matrix.arch }}"
+
+      - name: Verify artifact architecture and dependencies
+        run: |
+          artifact="dist/scrcpy-rfb-linux-${{ matrix.arch }}"
+          file "$artifact"
+          test -x "$artifact"
+          grep -F "scrcpy-rfb-linux-${{ matrix.arch }}" "$artifact.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: scrcpy-rfb-linux-${{ matrix.arch }}
+          path: |
+            dist/scrcpy-rfb-linux-${{ matrix.arch }}
+            dist/scrcpy-rfb-linux-${{ matrix.arch }}.sha256
+
+  release:
+    name: Update dev prerelease
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: scrcpy-rfb-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate build metadata
+        run: |
+          cat > dist/build-info.json <<EOF
+          {
+            "ref": "${GITHUB_REF_NAME}",
+            "commit": "${GITHUB_SHA}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "run_attempt": "${GITHUB_RUN_ATTEMPT}",
+            "workflow": "${GITHUB_WORKFLOW}",
+            "ffmpeg_commit": "998de74adf861c26df557e220996faa959419549"
+          }
+          EOF
+
+      - name: Create dev release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: dev
+          target_commitish: ${{ github.sha }}
+          name: Dev Build
+          body: |
+            Branch: `${{ github.ref_name }}`
+            Commit: `${{ github.sha }}`
+            Workflow Run: `${{ github.run_id }}`
+          files: |
+            dist/scrcpy-rfb-linux-amd64
+            dist/scrcpy-rfb-linux-amd64.sha256
+            dist/scrcpy-rfb-linux-arm64
+            dist/scrcpy-rfb-linux-arm64.sha256
+            dist/build-info.json
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move dev tag to current commit
+        run: |
+          git tag -f dev "${GITHUB_SHA}"
+          git push origin refs/tags/dev --force
