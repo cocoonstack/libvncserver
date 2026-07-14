@@ -4,6 +4,7 @@ Makefile
 LibVNCServer*.tar.gz
 build/
 doc/html/
+/dist/
 .ccls-cache
 .cachexs
 .log

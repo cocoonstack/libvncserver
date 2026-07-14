@@ -2430,6 +2430,11 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
             case rfbEncodingCoRRE:
             case rfbEncodingHextile:
             case rfbEncodingUltra:
+            case rfbEncodingOpenH264:
+            case rfbEncodingH264:
+                if ((enc == rfbEncodingOpenH264 || enc == rfbEncodingH264) &&
+                    cl->screen->h264EncoderCallback == NULL)
+                    break;
 #ifdef LIBVNCSERVER_HAVE_LIBZ
 	    case rfbEncodingZlib:
             case rfbEncodingZRLE:
@@ -3391,10 +3396,21 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
      */
 
      sraRgnOr(cl->modifiedRegion,cl->copyRegion);
-     sraRgnSubtract(cl->modifiedRegion,updateRegion);
-     sraRgnSubtract(cl->modifiedRegion,updateCopyRegion);
+     /* A video stream remains pending while the client is subscribed. The
+      * encoder callback blocks until its per-client cursor has another frame,
+      * so this neither spins nor requires one RFB request per frame. */
+     if (cl->preferredEncoding != rfbEncodingOpenH264 &&
+         cl->preferredEncoding != rfbEncodingH264) {
+         sraRgnSubtract(cl->modifiedRegion,updateRegion);
+         sraRgnSubtract(cl->modifiedRegion,updateCopyRegion);
+     }
 
-     sraRgnMakeEmpty(cl->requestedRegion);
+     /* H.264 is a streaming encoding. Keep the subscription active so a new
+      * server-side frame can wake the output thread immediately instead of
+      * adding one client/server round trip for every video frame. */
+     if (cl->preferredEncoding != rfbEncodingOpenH264 &&
+         cl->preferredEncoding != rfbEncodingH264)
+         sraRgnMakeEmpty(cl->requestedRegion);
      sraRgnMakeEmpty(cl->copyRegion);
      cl->copyDX = 0;
      cl->copyDY = 0;
@@ -3418,7 +3434,14 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
      */
     
     rfbStatRecordMessageSent(cl, rfbFramebufferUpdate, 0, 0);
-    if (cl->preferredEncoding == rfbEncodingCoRRE) {
+    if (cl->preferredEncoding == rfbEncodingOpenH264 ||
+        cl->preferredEncoding == rfbEncodingH264) {
+        if (!sraRgnEmpty(updateCopyRegion)) {
+            sraRgnOr(updateRegion, updateCopyRegion);
+            sraRgnMakeEmpty(updateCopyRegion);
+        }
+        nUpdateRegionRects = sraRgnEmpty(updateRegion) ? 0 : 1;
+    } else if (cl->preferredEncoding == rfbEncodingCoRRE) {
         nUpdateRegionRects = 0;
 
         for(i = sraRgnGetIterator(updateRegion); sraRgnIteratorNext(i,&rect);){
@@ -3582,7 +3605,12 @@ rfbSendFramebufferUpdate(rfbClientPtr cl,
 	        goto updateFailed;
     }
 
-    for(i = sraRgnGetIterator(updateRegion); sraRgnIteratorNext(i,&rect);){
+    if ((cl->preferredEncoding == rfbEncodingOpenH264 ||
+         cl->preferredEncoding == rfbEncodingH264) &&
+        !sraRgnEmpty(updateRegion)) {
+        if (!rfbSendRectEncodingH264(cl))
+            goto updateFailed;
+    } else for(i = sraRgnGetIterator(updateRegion); sraRgnIteratorNext(i,&rect);){
         int x = rect.x1;
         int y = rect.y1;
         int w = rect.x2 - x;
@@ -3664,6 +3692,74 @@ updateFailed:
 
     if(cl->screen->displayFinishedHook)
       cl->screen->displayFinishedHook(cl, result);
+    return result;
+}
+
+/*
+ * Send one full-screen H.264 rectangle. TigerVNC's H.264 payload is a
+ * network-order uint32 length, a network-order uint32 reset flag, followed by
+ * one complete H.264 access unit. The large payload bypasses updateBuf, whose
+ * fixed size is intended for traditional rectangle encoders.
+ */
+rfbBool
+rfbSendRectEncodingH264(rfbClientPtr cl)
+{
+    rfbFramebufferUpdateRectHeader rect;
+    char *frame = NULL;
+    char *packet = NULL;
+    size_t frameSize = 0;
+    size_t packetSize;
+    uint32_t value;
+    rfbBool result = FALSE;
+
+    if (cl->screen->h264EncoderCallback == NULL)
+        return FALSE;
+
+    if (!cl->screen->h264EncoderCallback(cl, &frame, &frameSize) ||
+        frame == NULL || frameSize == 0)
+        goto done;
+
+    if (frameSize > UINT32_MAX ||
+        frameSize > SIZE_MAX - sz_rfbFramebufferUpdateRectHeader - 8)
+        goto done;
+
+    packetSize = sz_rfbFramebufferUpdateRectHeader + 8 + frameSize;
+    if (packetSize > INT_MAX)
+        goto done;
+
+    packet = (char *)malloc(packetSize);
+    if (packet == NULL)
+        goto done;
+
+    rect.r.x = Swap16IfLE(0);
+    rect.r.y = Swap16IfLE(0);
+    rect.r.w = Swap16IfLE(cl->screen->width);
+    rect.r.h = Swap16IfLE(cl->screen->height);
+    rect.encoding = Swap32IfLE(cl->preferredEncoding);
+    memcpy(packet, &rect, sz_rfbFramebufferUpdateRectHeader);
+
+    value = Swap32IfLE((uint32_t)frameSize);
+    memcpy(packet + sz_rfbFramebufferUpdateRectHeader, &value, sizeof(value));
+    value = 0;
+    memcpy(packet + sz_rfbFramebufferUpdateRectHeader + 4, &value, sizeof(value));
+    memcpy(packet + sz_rfbFramebufferUpdateRectHeader + 8, frame, frameSize);
+
+    if (!rfbSendUpdateBuf(cl))
+        goto done;
+    if (rfbWriteExact(cl, packet, (int)packetSize) < 0)
+        goto done;
+
+    rfbStatRecordEncodingSent(cl, cl->preferredEncoding,
+                              packetSize,
+                              sz_rfbFramebufferUpdateRectHeader +
+                              cl->screen->width *
+                              (cl->format.bitsPerPixel / 8) *
+                              cl->screen->height);
+    result = TRUE;
+
+done:
+    free(packet);
+    free(frame);
     return result;
 }
 
@@ -4247,5 +4343,3 @@ rfbProcessUDPInput(rfbScreenInfoPtr rfbScreen)
 	rfbDisconnectUDPSock(rfbScreen);
     }
 }
-
-
