@@ -621,6 +621,17 @@ static void display_hook(rfbClientPtr client) {
         return;
     }
 
+    /* Ordinary clients should work with their defaults. Do not advertise a
+     * resizeable desktop: this bridge has a fixed-size scrcpy session, and
+     * several viewers terminate when their automatic SetDesktopSize request
+     * is rejected. H.264 clients retain the extension and explicitly opt out
+     * of remote resize because their integration is already specialized. */
+    client->useExtDesktopSize = FALSE;
+    client->useNewFBSize = FALSE;
+    client->newFBSizePending = FALSE;
+    client->tightQualityLevel = -1;
+    client->turboQualityLevel = -1;
+
     pthread_mutex_lock(&screen_buffer_mutex);
     while (running && !screen_frame_ready
             && client->sock != RFB_INVALID_SOCKET) {
