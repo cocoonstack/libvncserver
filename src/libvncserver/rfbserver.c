@@ -2389,6 +2389,7 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
 
         /* Reset all flags to defaults (allows us to switch between PointerPos and Server Drawn Cursors) */
         cl->preferredEncoding=-1;
+        cl->supportsH264Encoding    = FALSE;
         cl->useCopyRect              = FALSE;
         cl->useNewFBSize             = FALSE;
         cl->useExtDesktopSize        = FALSE;
@@ -2432,9 +2433,11 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
             case rfbEncodingUltra:
             case rfbEncodingOpenH264:
             case rfbEncodingH264:
-                if ((enc == rfbEncodingOpenH264 || enc == rfbEncodingH264) &&
-                    cl->screen->h264EncoderCallback == NULL)
-                    break;
+                if (enc == rfbEncodingOpenH264 || enc == rfbEncodingH264) {
+                    if (cl->screen->h264EncoderCallback == NULL)
+                        break;
+                    cl->supportsH264Encoding = TRUE;
+                }
 #ifdef LIBVNCSERVER_HAVE_LIBZ
 	    case rfbEncodingZlib:
             case rfbEncodingZRLE:

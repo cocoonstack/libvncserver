@@ -629,8 +629,10 @@ static void display_hook(rfbClientPtr client) {
     client->useExtDesktopSize = FALSE;
     client->useNewFBSize = FALSE;
     client->newFBSizePending = FALSE;
-    client->tightQualityLevel = -1;
-    client->turboQualityLevel = -1;
+    if (client->supportsH264Encoding) {
+        client->tightQualityLevel = -1;
+        client->turboQualityLevel = -1;
+    }
 
     pthread_mutex_lock(&screen_buffer_mutex);
     while (running && !screen_frame_ready

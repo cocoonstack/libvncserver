@@ -42,7 +42,9 @@ vncviewer -AutoSelect=0 -PreferredEncoding=H.264 -RemoteResize=0 -Shared=1 \
   host::5900
 ```
 
-Ordinary VNC clients use Tight, ZRLE, Hextile, or Raw fallback with their
+Ordinary VNC clients use Tight/JPEG, ZRLE, Hextile, or Raw fallback with their
 default settings. For maximum compatibility, the bridge suppresses dynamic
-desktop-size extensions on this path, exposes the fixed scrcpy size from
-ServerInit, and uses lossless Tight instead of its optional JPEG subencoding.
+desktop-size extensions on this path and exposes the fixed scrcpy size from
+ServerInit. A client that advertises H.264 but selects Tight is given lossless
+Tight, avoiding JPEG ABI problems in specialized H.264 viewer builds; regular
+VNC clients retain performant Tight/JPEG.
