@@ -32,3 +32,15 @@ prerelease:
 The binaries target the Ubuntu 22.04 userspace ABI and dynamically require
 only glibc, libm, zlib, and libjpeg.so.8. FFmpeg's H.264 decoder and swscale are
 linked statically.
+
+For an H.264-enabled TigerVNC viewer, turn off automatic encoding selection so
+it does not override the explicit H.264 preference. The bridge exposes the
+fixed scrcpy session size, so remote desktop resizing must also be disabled:
+
+```sh
+vncviewer -AutoSelect=0 -PreferredEncoding=H.264 -RemoteResize=0 -Shared=1 \
+  host::5900
+```
+
+An ordinary TigerVNC viewer uses the Tight/JPEG fallback with
+`-RemoteResize=0 -Shared=1 host::5900`.
