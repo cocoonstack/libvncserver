@@ -42,5 +42,7 @@ vncviewer -AutoSelect=0 -PreferredEncoding=H.264 -RemoteResize=0 -Shared=1 \
   host::5900
 ```
 
-An ordinary TigerVNC viewer uses the Tight/JPEG fallback with
-`-RemoteResize=0 -Shared=1 host::5900`.
+Ordinary VNC clients use Tight, ZRLE, Hextile, or Raw fallback with their
+default settings. For maximum compatibility, the bridge suppresses dynamic
+desktop-size extensions on this path, exposes the fixed scrcpy size from
+ServerInit, and uses lossless Tight instead of its optional JPEG subencoding.
