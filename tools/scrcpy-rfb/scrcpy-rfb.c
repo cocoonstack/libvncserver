@@ -43,6 +43,7 @@ struct frame {
 struct client_state {
     uint64_t next_sequence;
     int waiting_for_key_frame;
+    int framebuffer_lock_held;
     int previous_left_button;
     int last_pointer_x;
     int last_pointer_y;
@@ -67,6 +68,9 @@ static size_t framebuffer_size;
 static int fallback_frame_ready;
 static int fallback_decoder_ready_logged;
 static pthread_mutex_t fallback_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t screen_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t screen_buffer_cond = PTHREAD_COND_INITIALIZER;
+static int screen_frame_ready;
 static volatile sig_atomic_t fallback_mode;
 static volatile sig_atomic_t fallback_decoder_reset;
 static pthread_mutex_t pointer_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -605,6 +609,47 @@ static int is_h264_encoding(int encoding) {
     return encoding == rfbEncodingOpenH264 || encoding == rfbEncodingH264;
 }
 
+/* Ordinary encoders read screen->frameBuffer while their independent output
+ * threads are sending. Hold a shared publication lock for the whole update so
+ * a newly decoded frame cannot be copied over a client mid-rectangle. The
+ * first ordinary update also waits for the reset-triggered keyframe instead
+ * of exposing the calloc()ed black framebuffer. H.264 clients bypass this
+ * lock because their callback reads the packet queue, not the framebuffer. */
+static void display_hook(rfbClientPtr client) {
+    struct client_state *state = client->clientData;
+    if (!state || is_h264_encoding(client->preferredEncoding)) {
+        return;
+    }
+
+    pthread_mutex_lock(&screen_buffer_mutex);
+    while (running && !screen_frame_ready
+            && client->sock != RFB_INVALID_SOCKET) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 100 * 1000 * 1000;
+        if (deadline.tv_nsec >= 1000 * 1000 * 1000) {
+            ++deadline.tv_sec;
+            deadline.tv_nsec -= 1000 * 1000 * 1000;
+        }
+        pthread_cond_timedwait(&screen_buffer_cond, &screen_buffer_mutex,
+                               &deadline);
+    }
+    if (!running || client->sock == RFB_INVALID_SOCKET) {
+        pthread_mutex_unlock(&screen_buffer_mutex);
+        return;
+    }
+    state->framebuffer_lock_held = 1;
+}
+
+static void display_finished_hook(rfbClientPtr client, int result) {
+    (void) result;
+    struct client_state *state = client->clientData;
+    if (state && state->framebuffer_lock_held) {
+        state->framebuffer_lock_held = 0;
+        pthread_mutex_unlock(&screen_buffer_mutex);
+    }
+}
+
 static void count_client_modes(int *h264_clients, int *standard_clients) {
     *h264_clients = 0;
     *standard_clients = 0;
@@ -692,6 +737,8 @@ int main(int argc, char **argv) {
     rfb_screen->ptrAddEvent = pointer_event;
     rfb_screen->kbdAddEvent = keyboard_event;
     rfb_screen->h264EncoderCallback = h264_encoder_callback;
+    rfb_screen->displayHook = display_hook;
+    rfb_screen->displayFinishedHook = display_finished_hook;
     rfb_screen->ipv6port = -1;
     rfbInitServer(rfb_screen);
     rfbRunEventLoop(rfb_screen, -1, TRUE);
@@ -719,6 +766,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ordinary VNC fallback %s\n",
                     requested_fallback ? "enabled" : "disabled");
             if (requested_fallback) {
+                pthread_mutex_lock(&screen_buffer_mutex);
+                screen_frame_ready = 0;
+                pthread_mutex_unlock(&screen_buffer_mutex);
                 fallback_decoder_reset = 1;
                 if (reset_scrcpy_video() < 0) {
                     fprintf(stderr, "failed to request a fallback keyframe\n");
@@ -738,7 +788,11 @@ int main(int argc, char **argv) {
 
         pthread_mutex_lock(&fallback_mutex);
         if (fallback_frame_ready) {
+            pthread_mutex_lock(&screen_buffer_mutex);
             memcpy(rfb_screen->frameBuffer, fallback_buffer, framebuffer_size);
+            screen_frame_ready = 1;
+            pthread_cond_broadcast(&screen_buffer_cond);
+            pthread_mutex_unlock(&screen_buffer_mutex);
             fallback_frame_ready = 0;
             mark_modified = 1;
         }
@@ -757,6 +811,7 @@ int main(int argc, char **argv) {
     shutdown(video_fd, SHUT_RDWR);
     shutdown(control_fd, SHUT_RDWR);
     pthread_cond_broadcast(&frame_cond);
+    pthread_cond_broadcast(&screen_buffer_cond);
     pthread_join(video_thread, NULL);
     pthread_join(control_thread, NULL);
 
