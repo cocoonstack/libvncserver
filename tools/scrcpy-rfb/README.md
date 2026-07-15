@@ -10,13 +10,22 @@ scrcpy 4.1 to one RFB/VNC port.
 - When the first ordinary VNC client connects, the bridge asks scrcpy 4.1 to
   reset the video encoder so a static Android screen still produces an
   immediate config packet and keyframe instead of a black fallback frame.
-- Ordinary clients wait for that first decoded frame. Framebuffer publication
-  is synchronized with each client's complete RFB update, so concurrent
-  Tight/JPEG or Raw clients never observe a black or partially replaced frame.
+- Ordinary clients wait for that first decoded frame. The bridge compares
+  32-pixel tiles and marks only changed runs, so Tight/JPEG, ZRLE, Hextile, and
+  Raw do not receive an unconditional full-screen rectangle on every frame.
+- The decoded fallback is a latest-frame-only buffer. Slow clients accumulate
+  damage against the current framebuffer instead of queueing stale video
+  frames, and publication adapts between 60, 30, and 20 FPS using the slowest
+  ordinary client's measured update time.
+- Framebuffer publication uses a writer lock while ordinary client encoders use
+  shared reader locks. Multiple ordinary clients can encode the same stable
+  frame concurrently without observing a black or partially replaced frame.
 - Each H.264 client has its own frame cursor; a slow client skips to a later
   keyframe without blocking other clients.
 - H.264 subscriptions stay active so new frames are pushed without a
-  per-frame RFB request/response round trip.
+  per-frame RFB request/response round trip. H.264 clients retain their own
+  full-screen streaming subscription, so their wakeups do not turn ordinary
+  clients' tile damage back into full-screen updates.
 - Client network output runs in independent threads. Input messages are
   serialized, and one client owns an active pointer drag until button-up or
   disconnect so concurrent users cannot leave Android with a stuck touch.

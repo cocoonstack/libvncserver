@@ -32,6 +32,10 @@
 
 #define FRAME_QUEUE_CAPACITY 90
 #define MAX_PACKET_SIZE (8U * 1024U * 1024U)
+#define FALLBACK_TILE_SIZE 32
+#define FALLBACK_FAST_UPDATE_US 14000
+#define FALLBACK_MEDIUM_UPDATE_US 30000
+#define FALLBACK_ADAPT_INTERVAL_NS UINT64_C(1000000000)
 
 struct frame {
     uint8_t *data;
@@ -42,18 +46,27 @@ struct frame {
 
 struct client_state {
     uint64_t next_sequence;
+    uint64_t ordinary_update_us_ema;
+    struct timespec ordinary_update_started;
     int waiting_for_key_frame;
     int framebuffer_lock_held;
+    int ordinary_update_timer_active;
     int previous_left_button;
     int last_pointer_x;
     int last_pointer_y;
+};
+
+struct damage_rect {
+    int x1;
+    int y1;
+    int x2;
+    int y2;
 };
 
 static struct frame frame_queue[FRAME_QUEUE_CAPACITY];
 static size_t frame_queue_head;
 static size_t frame_queue_count;
 static uint64_t frame_next_sequence = 1;
-static uint64_t frame_generation;
 static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t frame_cond = PTHREAD_COND_INITIALIZER;
 
@@ -68,8 +81,10 @@ static size_t framebuffer_size;
 static int fallback_frame_ready;
 static int fallback_decoder_ready_logged;
 static pthread_mutex_t fallback_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t screen_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t screen_buffer_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_mutex_t screen_ready_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t screen_buffer_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t metrics_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int screen_frame_ready;
 static volatile sig_atomic_t fallback_mode;
 static volatile sig_atomic_t fallback_decoder_reset;
@@ -86,6 +101,21 @@ static rfbClientPtr pointer_owner;
 
 static void client_gone(rfbClientPtr client);
 static int send_touch(uint8_t action, int x, int y, int pressed);
+
+static uint64_t monotonic_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * UINT64_C(1000000000)
+         + (uint64_t) now.tv_nsec;
+}
+
+static uint64_t elapsed_us(const struct timespec *start,
+                           const struct timespec *end) {
+    int64_t seconds = end->tv_sec - start->tv_sec;
+    int64_t nanoseconds = end->tv_nsec - start->tv_nsec;
+    int64_t total = seconds * INT64_C(1000000000) + nanoseconds;
+    return total > 0 ? (uint64_t) total / 1000 : 0;
+}
 
 static uint32_t read_u32be(const uint8_t *p) {
     return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16)
@@ -211,7 +241,6 @@ static void enqueue_frame(uint8_t *data, size_t size, int key_frame) {
     frame_queue[tail].key_frame = key_frame;
     frame_queue[tail].sequence = frame_next_sequence++;
     ++frame_queue_count;
-    ++frame_generation;
     pthread_cond_broadcast(&frame_cond);
     pthread_mutex_unlock(&frame_mutex);
 }
@@ -609,6 +638,125 @@ static int is_h264_encoding(int encoding) {
     return encoding == rfbEncodingOpenH264 || encoding == rfbEncodingH264;
 }
 
+/* Publish only pixels that differ from the last stable framebuffer. The video
+ * thread intentionally owns a single pending fallback buffer: when VNC output
+ * is slower than Android, swscale replaces that pending image and this function
+ * publishes the newest image instead of replaying stale decoded frames. */
+static size_t publish_latest_fallback_frame(struct damage_rect *rects,
+                                            size_t rect_capacity,
+                                            int *full_screen,
+                                            int *consumed) {
+    size_t rect_count = 0;
+    *full_screen = 0;
+    *consumed = 0;
+
+    pthread_mutex_lock(&fallback_mutex);
+    int frame_pending = fallback_frame_ready;
+    pthread_mutex_unlock(&fallback_mutex);
+    if (!frame_pending) {
+        return 0;
+    }
+
+    /* Do not hold fallback_mutex while waiting for slow VNC readers. The video
+     * thread can keep replacing the pending image, and H.264 passthrough stays
+     * independent of ordinary-client backpressure. */
+    pthread_rwlock_wrlock(&screen_buffer_lock);
+    pthread_mutex_lock(&fallback_mutex);
+    if (!fallback_frame_ready) {
+        pthread_mutex_unlock(&fallback_mutex);
+        pthread_rwlock_unlock(&screen_buffer_lock);
+        return 0;
+    }
+    *consumed = 1;
+    pthread_mutex_lock(&screen_ready_mutex);
+    int first_frame = !screen_frame_ready;
+    pthread_mutex_unlock(&screen_ready_mutex);
+
+    if (first_frame) {
+        memcpy(rfb_screen->frameBuffer, fallback_buffer, framebuffer_size);
+        *full_screen = 1;
+    } else {
+        const int row_stride = video_width * 4;
+        for (int y1 = 0; y1 < video_height; y1 += FALLBACK_TILE_SIZE) {
+            int y2 = y1 + FALLBACK_TILE_SIZE;
+            if (y2 > video_height) {
+                y2 = video_height;
+            }
+            int run_x1 = -1;
+
+            for (int x1 = 0; x1 < video_width; x1 += FALLBACK_TILE_SIZE) {
+                int x2 = x1 + FALLBACK_TILE_SIZE;
+                if (x2 > video_width) {
+                    x2 = video_width;
+                }
+                size_t row_bytes = (size_t) (x2 - x1) * 4;
+                int changed = 0;
+
+                for (int y = y1; y < y2; ++y) {
+                    size_t offset = (size_t) y * (size_t) row_stride
+                                  + (size_t) x1 * 4;
+                    if (memcmp(rfb_screen->frameBuffer + offset,
+                               fallback_buffer + offset, row_bytes) != 0) {
+                        changed = 1;
+                        break;
+                    }
+                }
+
+                if (changed) {
+                    for (int y = y1; y < y2; ++y) {
+                        size_t offset = (size_t) y * (size_t) row_stride
+                                      + (size_t) x1 * 4;
+                        memcpy(rfb_screen->frameBuffer + offset,
+                               fallback_buffer + offset, row_bytes);
+                    }
+                    if (run_x1 < 0) {
+                        run_x1 = x1;
+                    }
+                }
+
+                if ((!changed || x2 == video_width) && run_x1 >= 0) {
+                    int run_x2 = changed ? x2 : x1;
+                    int merged = 0;
+                    for (size_t i = rect_count; i > 0; --i) {
+                        struct damage_rect *previous = &rects[i - 1];
+                        if (previous->x1 == run_x1
+                                && previous->x2 == run_x2
+                                && previous->y2 == y1) {
+                            previous->y2 = y2;
+                            merged = 1;
+                            break;
+                        }
+                    }
+                    /* Reuse the previous tile row's identical horizontal run,
+                     * turning full-motion frames into a few tall rectangles. */
+                    if (!merged) {
+                        if (rect_count < rect_capacity) {
+                            rects[rect_count++] = (struct damage_rect) {
+                                .x1 = run_x1,
+                                .y1 = y1,
+                                .x2 = run_x2,
+                                .y2 = y2,
+                            };
+                        } else {
+                            *full_screen = 1;
+                        }
+                    }
+                    run_x1 = -1;
+                }
+            }
+        }
+    }
+
+    fallback_frame_ready = 0;
+    pthread_mutex_lock(&screen_ready_mutex);
+    screen_frame_ready = 1;
+    pthread_cond_broadcast(&screen_buffer_cond);
+    pthread_mutex_unlock(&screen_ready_mutex);
+    pthread_rwlock_unlock(&screen_buffer_lock);
+    pthread_mutex_unlock(&fallback_mutex);
+    return rect_count;
+}
+
 /* Ordinary encoders read screen->frameBuffer while their independent output
  * threads are sending. Hold a shared publication lock for the whole update so
  * a newly decoded frame cannot be copied over a client mid-rectangle. The
@@ -634,7 +782,7 @@ static void display_hook(rfbClientPtr client) {
         client->turboQualityLevel = -1;
     }
 
-    pthread_mutex_lock(&screen_buffer_mutex);
+    pthread_mutex_lock(&screen_ready_mutex);
     while (running && !screen_frame_ready
             && client->sock != RFB_INVALID_SOCKET) {
         struct timespec deadline;
@@ -644,13 +792,20 @@ static void display_hook(rfbClientPtr client) {
             ++deadline.tv_sec;
             deadline.tv_nsec -= 1000 * 1000 * 1000;
         }
-        pthread_cond_timedwait(&screen_buffer_cond, &screen_buffer_mutex,
+        pthread_cond_timedwait(&screen_buffer_cond, &screen_ready_mutex,
                                &deadline);
     }
     if (!running || client->sock == RFB_INVALID_SOCKET) {
-        pthread_mutex_unlock(&screen_buffer_mutex);
+        pthread_mutex_unlock(&screen_ready_mutex);
         return;
     }
+    pthread_mutex_unlock(&screen_ready_mutex);
+
+    pthread_rwlock_rdlock(&screen_buffer_lock);
+    pthread_mutex_lock(&metrics_mutex);
+    clock_gettime(CLOCK_MONOTONIC, &state->ordinary_update_started);
+    state->ordinary_update_timer_active = 1;
+    pthread_mutex_unlock(&metrics_mutex);
     state->framebuffer_lock_held = 1;
 }
 
@@ -658,14 +813,31 @@ static void display_finished_hook(rfbClientPtr client, int result) {
     (void) result;
     struct client_state *state = client->clientData;
     if (state && state->framebuffer_lock_held) {
+        struct timespec finished;
+        clock_gettime(CLOCK_MONOTONIC, &finished);
+        pthread_mutex_lock(&metrics_mutex);
+        if (state->ordinary_update_timer_active) {
+            uint64_t sample = elapsed_us(&state->ordinary_update_started,
+                                         &finished);
+            if (!state->ordinary_update_us_ema) {
+                state->ordinary_update_us_ema = sample;
+            } else {
+                state->ordinary_update_us_ema =
+                        (state->ordinary_update_us_ema * 3 + sample) / 4;
+            }
+            state->ordinary_update_timer_active = 0;
+        }
+        pthread_mutex_unlock(&metrics_mutex);
         state->framebuffer_lock_held = 0;
-        pthread_mutex_unlock(&screen_buffer_mutex);
+        pthread_rwlock_unlock(&screen_buffer_lock);
     }
 }
 
-static void count_client_modes(int *h264_clients, int *standard_clients) {
+static void count_client_modes(int *h264_clients, int *standard_clients,
+                               uint64_t *slowest_update_us) {
     *h264_clients = 0;
     *standard_clients = 0;
+    *slowest_update_us = 0;
 
     rfbClientIteratorPtr iterator = rfbGetClientIterator(rfb_screen);
     rfbClientPtr client;
@@ -677,6 +849,15 @@ static void count_client_modes(int *h264_clients, int *standard_clients) {
             ++*h264_clients;
         } else {
             ++*standard_clients;
+            struct client_state *state = client->clientData;
+            if (state) {
+                pthread_mutex_lock(&metrics_mutex);
+                uint64_t update_us = state->ordinary_update_us_ema;
+                pthread_mutex_unlock(&metrics_mutex);
+                if (update_us > *slowest_update_us) {
+                    *slowest_update_us = update_us;
+                }
+            }
         }
     }
     rfbReleaseClientIterator(iterator);
@@ -744,6 +925,15 @@ int main(int argc, char **argv) {
     if (!rfb_screen->frameBuffer) {
         return 1;
     }
+    size_t damage_rect_capacity =
+            ((size_t) video_width + FALLBACK_TILE_SIZE - 1) / FALLBACK_TILE_SIZE
+          * (((size_t) video_height + FALLBACK_TILE_SIZE - 1)
+             / FALLBACK_TILE_SIZE);
+    struct damage_rect *damage_rects =
+            calloc(damage_rect_capacity, sizeof(*damage_rects));
+    if (!damage_rects) {
+        return 1;
+    }
     rfb_screen->alwaysShared = TRUE;
     rfb_screen->neverShared = FALSE;
     rfb_screen->newClientHook = new_client;
@@ -758,13 +948,18 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "RFB listening on port %d (H.264 passthrough + Tight/JPEG fallback)\n",
             rfb_screen->port);
-    uint64_t last_marked_generation = 0;
+    uint64_t last_fallback_publish_ns = 0;
+    uint64_t last_adapt_ns = monotonic_ns();
+    int ordinary_fps = 60;
+    int faster_intervals = 0;
     int previous_h264_clients = -1;
     int previous_standard_clients = -1;
     while (running && rfbIsActive(rfb_screen)) {
         int h264_clients;
         int standard_clients;
-        count_client_modes(&h264_clients, &standard_clients);
+        uint64_t slowest_update_us;
+        count_client_modes(&h264_clients, &standard_clients,
+                           &slowest_update_us);
         if (h264_clients != previous_h264_clients
                 || standard_clients != previous_standard_clients) {
             fprintf(stderr, "active VNC clients: H.264=%d ordinary=%d\n",
@@ -779,40 +974,76 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ordinary VNC fallback %s\n",
                     requested_fallback ? "enabled" : "disabled");
             if (requested_fallback) {
-                pthread_mutex_lock(&screen_buffer_mutex);
+                pthread_mutex_lock(&screen_ready_mutex);
                 screen_frame_ready = 0;
-                pthread_mutex_unlock(&screen_buffer_mutex);
+                pthread_mutex_unlock(&screen_ready_mutex);
+                pthread_mutex_lock(&fallback_mutex);
+                fallback_frame_ready = 0;
+                pthread_mutex_unlock(&fallback_mutex);
                 fallback_decoder_reset = 1;
+                last_fallback_publish_ns = 0;
+                ordinary_fps = 60;
+                faster_intervals = 0;
                 if (reset_scrcpy_video() < 0) {
                     fprintf(stderr, "failed to request a fallback keyframe\n");
                 }
             }
         }
 
-        pthread_mutex_lock(&frame_mutex);
-        uint64_t generation = frame_generation;
-        pthread_mutex_unlock(&frame_mutex);
-
-        int mark_modified = 0;
-        if (h264_clients > 0 && generation != last_marked_generation) {
-            mark_modified = 1;
+        uint64_t now_ns = monotonic_ns();
+        if (standard_clients > 0
+                && now_ns - last_adapt_ns >= FALLBACK_ADAPT_INTERVAL_NS) {
+            int desired_fps = slowest_update_us > FALLBACK_MEDIUM_UPDATE_US ? 20
+                            : slowest_update_us > FALLBACK_FAST_UPDATE_US ? 30
+                            : 60;
+            int previous_fps = ordinary_fps;
+            if (desired_fps < ordinary_fps) {
+                ordinary_fps = desired_fps;
+                faster_intervals = 0;
+            } else if (desired_fps > ordinary_fps) {
+                if (++faster_intervals >= 3) {
+                    ordinary_fps = desired_fps;
+                    faster_intervals = 0;
+                }
+            } else {
+                faster_intervals = 0;
+            }
+            if (ordinary_fps != previous_fps) {
+                fprintf(stderr,
+                        "ordinary VNC publish rate: %d fps (slowest update %.1f ms)\n",
+                        ordinary_fps, (double) slowest_update_us / 1000.0);
+            }
+            last_adapt_ns = now_ns;
         }
-        last_marked_generation = generation;
 
-        pthread_mutex_lock(&fallback_mutex);
-        if (fallback_frame_ready) {
-            pthread_mutex_lock(&screen_buffer_mutex);
-            memcpy(rfb_screen->frameBuffer, fallback_buffer, framebuffer_size);
-            screen_frame_ready = 1;
-            pthread_cond_broadcast(&screen_buffer_cond);
-            pthread_mutex_unlock(&screen_buffer_mutex);
-            fallback_frame_ready = 0;
-            mark_modified = 1;
-        }
-        pthread_mutex_unlock(&fallback_mutex);
-
-        if (mark_modified && h264_clients + standard_clients > 0) {
-            rfbMarkRectAsModified(rfb_screen, 0, 0, video_width, video_height);
+        uint64_t publish_interval_ns = UINT64_C(1000000000)
+                                     / (uint64_t) ordinary_fps;
+        pthread_mutex_lock(&screen_ready_mutex);
+        int first_frame_needed = !screen_frame_ready;
+        pthread_mutex_unlock(&screen_ready_mutex);
+        if (standard_clients > 0
+                && (first_frame_needed || !last_fallback_publish_ns
+                    || now_ns - last_fallback_publish_ns
+                       >= publish_interval_ns)) {
+            int full_screen;
+            int consumed;
+            size_t rect_count = publish_latest_fallback_frame(
+                    damage_rects, damage_rect_capacity, &full_screen, &consumed);
+            if (consumed) {
+                last_fallback_publish_ns = monotonic_ns();
+                if (full_screen) {
+                    rfbMarkRectAsModified(rfb_screen, 0, 0,
+                                          video_width, video_height);
+                } else {
+                    for (size_t i = 0; i < rect_count; ++i) {
+                        rfbMarkRectAsModified(rfb_screen,
+                                              damage_rects[i].x1,
+                                              damage_rects[i].y1,
+                                              damage_rects[i].x2,
+                                              damage_rects[i].y2);
+                    }
+                }
+            }
         }
 
         struct timespec delay = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
@@ -835,6 +1066,7 @@ int main(int argc, char **argv) {
     av_frame_free(&decoder_frame);
     avcodec_free_context(&decoder_context);
     free(fallback_buffer);
+    free(damage_rects);
     pthread_mutex_lock(&frame_mutex);
     clear_frame_queue_locked();
     pthread_mutex_unlock(&frame_mutex);
