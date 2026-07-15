@@ -467,7 +467,8 @@ clientOutput(void *data)
 		}
 		if (cl->state != RFB_NORMAL || cl->onHold) {
 			/* just sleep until things get normal */
-		        THREAD_SLEEP_MS(cl->screen->deferUpdateTime);
+		        THREAD_SLEEP_MS(cl->screen->deferUpdateTime > 0
+		                        ? cl->screen->deferUpdateTime : 1);
 			continue;
 		}
 
@@ -492,8 +493,10 @@ clientOutput(void *data)
         }
         
         /* OK, now, to save bandwidth, wait a little while for more
-           updates to come along. */
-	THREAD_SLEEP_MS(cl->screen->deferUpdateTime);
+           updates to come along. Applications that publish already-coalesced
+           frames may explicitly set deferUpdateTime to zero. */
+	if (cl->screen->deferUpdateTime > 0)
+	    THREAD_SLEEP_MS(cl->screen->deferUpdateTime);
 
         /* Now, get the region we're going to update, and remove
            it from cl->modifiedRegion _before_ we send the update.

@@ -5,6 +5,9 @@
 #include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
+#ifdef __linux__
+#include <netinet/tcp.h>
+#endif
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -36,6 +39,12 @@
 #define FALLBACK_FAST_UPDATE_US 14000
 #define FALLBACK_MEDIUM_UPDATE_US 30000
 #define FALLBACK_ADAPT_INTERVAL_NS UINT64_C(1000000000)
+#define FALLBACK_TCP_SEND_BUFFER (256 * 1024)
+#define FALLBACK_TCP_NOTSENT_LOWAT (64 * 1024)
+#define SCROLL_ROW_SAMPLES 16
+#define SCROLL_SAMPLE_ROW_STEP 8
+#define SCROLL_MIN_SHIFT 4
+#define SCROLL_MAX_SHIFT 160
 
 struct frame {
     uint8_t *data;
@@ -48,6 +57,8 @@ struct client_state {
     uint64_t next_sequence;
     uint64_t ordinary_update_us_ema;
     struct timespec ordinary_update_started;
+    int ordinary_requested_jpeg_quality;
+    int ordinary_applied_jpeg_quality;
     int waiting_for_key_frame;
     int framebuffer_lock_held;
     int ordinary_update_timer_active;
@@ -61,6 +72,11 @@ struct damage_rect {
     int y1;
     int x2;
     int y2;
+};
+
+struct scroll_row {
+    uint8_t luma[SCROLL_ROW_SAMPLES];
+    uint8_t informative;
 };
 
 static struct frame frame_queue[FRAME_QUEUE_CAPACITY];
@@ -497,6 +513,24 @@ static enum rfbNewClientAction new_client(rfbClientPtr client) {
         return RFB_CLIENT_REFUSE;
     }
 
+    state->ordinary_requested_jpeg_quality = -1;
+    state->ordinary_applied_jpeg_quality = -1;
+
+    int send_buffer = FALLBACK_TCP_SEND_BUFFER;
+    if (setsockopt(client->sock, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                   sizeof(send_buffer)) < 0) {
+        fprintf(stderr, "failed to cap VNC send buffer for %s: %s\n",
+                client->host, strerror(errno));
+    }
+#ifdef TCP_NOTSENT_LOWAT
+    int notsent_lowat = FALLBACK_TCP_NOTSENT_LOWAT;
+    if (setsockopt(client->sock, IPPROTO_TCP, TCP_NOTSENT_LOWAT,
+                   &notsent_lowat, sizeof(notsent_lowat)) < 0) {
+        fprintf(stderr, "failed to set TCP_NOTSENT_LOWAT for %s: %s\n",
+                client->host, strerror(errno));
+    }
+#endif
+
     pthread_mutex_lock(&frame_mutex);
     state->next_sequence = latest_key_sequence_locked();
     state->waiting_for_key_frame = state->next_sequence == frame_next_sequence;
@@ -638,15 +672,263 @@ static int is_h264_encoding(int encoding) {
     return encoding == rfbEncodingOpenH264 || encoding == rfbEncodingH264;
 }
 
+static void scroll_content_bounds(int height, int *top, int *bottom) {
+    int margin = height / 20;
+    if (margin < 32) {
+        margin = 32;
+    }
+    *top = margin;
+    *bottom = height - margin;
+}
+
+static void describe_scroll_rows(const uint8_t *frame, int width, int height,
+                                 struct scroll_row *rows) {
+    int top;
+    int bottom;
+    scroll_content_bounds(height, &top, &bottom);
+    int x1 = width / 10;
+    int span = width - 2 * x1;
+
+    memset(rows, 0, (size_t) height * sizeof(*rows));
+    for (int y = top; y < bottom; ++y) {
+        unsigned minimum = 255;
+        unsigned maximum = 0;
+        unsigned transitions = 0;
+        unsigned previous = 0;
+        for (int sample = 0; sample < SCROLL_ROW_SAMPLES; ++sample) {
+            int x = x1 + (2 * sample + 1) * span
+                       / (2 * SCROLL_ROW_SAMPLES);
+            const uint8_t *pixel = frame
+                    + ((size_t) y * (size_t) width + (size_t) x) * 4;
+            unsigned luma = (77U * pixel[0] + 150U * pixel[1]
+                             + 29U * pixel[2]) >> 8;
+            rows[y].luma[sample] = (uint8_t) luma;
+            if (luma < minimum) {
+                minimum = luma;
+            }
+            if (luma > maximum) {
+                maximum = luma;
+            }
+            if (sample) {
+                transitions += luma > previous ? luma - previous
+                                               : previous - luma;
+            }
+            previous = luma;
+        }
+        rows[y].informative = maximum - minimum >= 18 && transitions >= 48;
+    }
+}
+
+static int scroll_rows_match(const struct scroll_row *old_row,
+                             const struct scroll_row *new_row) {
+    unsigned difference = 0;
+    unsigned close_samples = 0;
+    for (int sample = 0; sample < SCROLL_ROW_SAMPLES; ++sample) {
+        int delta = (int) old_row->luma[sample]
+                  - (int) new_row->luma[sample];
+        unsigned absolute = (unsigned) (delta < 0 ? -delta : delta);
+        difference += absolute;
+        if (absolute <= 12) {
+            ++close_samples;
+        }
+    }
+    return difference <= SCROLL_ROW_SAMPLES * 7
+        && close_samples * 4 >= SCROLL_ROW_SAMPLES * 3;
+}
+
+/* Detect a high-confidence vertical translation. Exact pixel equality is too
+ * brittle after H.264 reconstruction, so compare sparse luma descriptors and
+ * ignore flat rows. A later tile pass always repairs fixed headers, exposed
+ * rows, and any false-positive area before it is published as pixel damage. */
+static int detect_vertical_scroll(const uint8_t *old_frame,
+                                  const uint8_t *new_frame,
+                                  int width, int height) {
+    int top;
+    int bottom;
+    scroll_content_bounds(height, &top, &bottom);
+    int maximum_shift = (bottom - top) / 3;
+    if (maximum_shift > SCROLL_MAX_SHIFT) {
+        maximum_shift = SCROLL_MAX_SHIFT;
+    }
+    if (maximum_shift < SCROLL_MIN_SHIFT) {
+        return 0;
+    }
+
+    struct scroll_row *old_rows = calloc((size_t) height, sizeof(*old_rows));
+    struct scroll_row *new_rows = calloc((size_t) height, sizeof(*new_rows));
+    int *scores = calloc((size_t) (2 * maximum_shift + 1), sizeof(*scores));
+    int *matches = calloc((size_t) (2 * maximum_shift + 1), sizeof(*matches));
+    if (!old_rows || !new_rows || !scores || !matches) {
+        free(old_rows);
+        free(new_rows);
+        free(scores);
+        free(matches);
+        return 0;
+    }
+
+    describe_scroll_rows(old_frame, width, height, old_rows);
+    describe_scroll_rows(new_frame, width, height, new_rows);
+    for (int dy = -maximum_shift; dy <= maximum_shift; ++dy) {
+        if (dy > -SCROLL_MIN_SHIFT && dy < SCROLL_MIN_SHIFT) {
+            continue;
+        }
+        int valid_rows = 0;
+        int matching_rows = 0;
+        for (int y = top; y < bottom; y += SCROLL_SAMPLE_ROW_STEP) {
+            int source_y = y - dy;
+            if (source_y < top || source_y >= bottom
+                    || !new_rows[y].informative) {
+                continue;
+            }
+            ++valid_rows;
+            if (old_rows[source_y].informative
+                    && scroll_rows_match(&old_rows[source_y], &new_rows[y])) {
+                ++matching_rows;
+            }
+        }
+        int index = dy + maximum_shift;
+        matches[index] = matching_rows;
+        scores[index] = valid_rows ? matching_rows * 1000 / valid_rows : 0;
+    }
+
+    int best_dy = 0;
+    int best_score = 0;
+    int best_matches = 0;
+    for (int dy = -maximum_shift; dy <= maximum_shift; ++dy) {
+        int index = dy + maximum_shift;
+        if (scores[index] > best_score
+                || (scores[index] == best_score
+                    && matches[index] > best_matches)) {
+            best_dy = dy;
+            best_score = scores[index];
+            best_matches = matches[index];
+        }
+    }
+
+    int second_score = 0;
+    for (int dy = -maximum_shift; dy <= maximum_shift; ++dy) {
+        if (dy >= best_dy - 2 && dy <= best_dy + 2) {
+            continue;
+        }
+        int score = scores[dy + maximum_shift];
+        if (score > second_score) {
+            second_score = score;
+        }
+    }
+
+    free(old_rows);
+    free(new_rows);
+    free(scores);
+    free(matches);
+    if (best_matches < 10 || best_score < 450
+            || (best_score < 800 && best_score - second_score < 100)) {
+        return 0;
+    }
+    return best_dy;
+}
+
+static int run_self_test(void) {
+    const int width = 320;
+    const int height = 480;
+    const int expected_dy = -24;
+    size_t size = (size_t) width * (size_t) height * 4;
+    uint8_t *old_frame = malloc(size);
+    uint8_t *new_frame = malloc(size);
+    if (!old_frame || !new_frame) {
+        free(old_frame);
+        free(new_frame);
+        return 1;
+    }
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            uint8_t *pixel = old_frame
+                    + ((size_t) y * (size_t) width + (size_t) x) * 4;
+            pixel[0] = (uint8_t) ((x * 11 + y * 3 + (x * y) / 17) & 0xff);
+            pixel[1] = (uint8_t) ((x * 5 + y * 13 + (x * y) / 29) & 0xff);
+            pixel[2] = (uint8_t) ((x * 7 + y * 17 + (x * y) / 37) & 0xff);
+            pixel[3] = 255;
+        }
+    }
+    memcpy(new_frame, old_frame, size);
+    if (detect_vertical_scroll(old_frame, new_frame, width, height) != 0) {
+        fprintf(stderr, "scroll self-test: static frame was misdetected\n");
+        free(old_frame);
+        free(new_frame);
+        return 1;
+    }
+
+    int top;
+    int bottom;
+    scroll_content_bounds(height, &top, &bottom);
+    for (int y = top; y < bottom + expected_dy; ++y) {
+        memcpy(new_frame + (size_t) y * (size_t) width * 4,
+               old_frame + (size_t) (y - expected_dy) * (size_t) width * 4,
+               (size_t) width * 4);
+    }
+    int detected_dy = detect_vertical_scroll(old_frame, new_frame,
+                                              width, height);
+    free(old_frame);
+    free(new_frame);
+    if (detected_dy != expected_dy) {
+        fprintf(stderr, "scroll self-test: expected dy=%d, got %d\n",
+                expected_dy, detected_dy);
+        return 1;
+    }
+    fprintf(stderr, "scrcpy-rfb self-test passed\n");
+    return 0;
+}
+
+static void adapt_client_jpeg(rfbClientPtr client,
+                              struct client_state *state) {
+    if (client->preferredEncoding != rfbEncodingTight
+            || client->supportsH264Encoding) {
+        return;
+    }
+
+    int previous_quality = client->turboQualityLevel;
+    int target_quality = -1;
+    uint64_t update_us;
+    pthread_mutex_lock(&metrics_mutex);
+    if (client->turboQualityLevel
+            != state->ordinary_applied_jpeg_quality) {
+        state->ordinary_requested_jpeg_quality = client->turboQualityLevel;
+        state->ordinary_applied_jpeg_quality = client->turboQualityLevel;
+    }
+    update_us = state->ordinary_update_us_ema;
+    if (state->ordinary_requested_jpeg_quality >= 0) {
+        target_quality = update_us > FALLBACK_MEDIUM_UPDATE_US ? 80
+                       : update_us > FALLBACK_FAST_UPDATE_US ? 86 : 92;
+        if (target_quality > state->ordinary_requested_jpeg_quality) {
+            target_quality = state->ordinary_requested_jpeg_quality;
+        }
+        state->ordinary_applied_jpeg_quality = target_quality;
+    }
+    pthread_mutex_unlock(&metrics_mutex);
+
+    if (target_quality >= 0) {
+        client->turboQualityLevel = target_quality;
+        client->tightCompressLevel = 1;
+        if (target_quality != previous_quality) {
+            fprintf(stderr,
+                    "ordinary Tight JPEG for %s: Q%d (update %.1f ms)\n",
+                    client->host, target_quality, (double) update_us / 1000.0);
+        }
+    }
+}
+
 /* Publish only pixels that differ from the last stable framebuffer. The video
  * thread intentionally owns a single pending fallback buffer: when VNC output
  * is slower than Android, swscale replaces that pending image and this function
  * publishes the newest image instead of replaying stale decoded frames. */
 static size_t publish_latest_fallback_frame(struct damage_rect *rects,
                                             size_t rect_capacity,
+                                            int enable_copyrect,
+                                            int *copyrect_dy,
                                             int *full_screen,
                                             int *consumed) {
     size_t rect_count = 0;
+    *copyrect_dy = 0;
     *full_screen = 0;
     *consumed = 0;
 
@@ -676,6 +958,23 @@ static size_t publish_latest_fallback_frame(struct damage_rect *rects,
         memcpy(rfb_screen->frameBuffer, fallback_buffer, framebuffer_size);
         *full_screen = 1;
     } else {
+        if (enable_copyrect) {
+            int dy = detect_vertical_scroll(
+                    (const uint8_t *) rfb_screen->frameBuffer,
+                    fallback_buffer, video_width, video_height);
+            if (dy) {
+                int top;
+                int bottom;
+                scroll_content_bounds(video_height, &top, &bottom);
+                int destination_top = dy > 0 ? top + dy : top;
+                int destination_bottom = dy < 0 ? bottom + dy : bottom;
+                if (destination_bottom > destination_top) {
+                    rfbDoCopyRect(rfb_screen, 0, destination_top,
+                                  video_width, destination_bottom, 0, dy);
+                    *copyrect_dy = dy;
+                }
+            }
+        }
         const int row_stride = video_width * 4;
         for (int y1 = 0; y1 < video_height; y1 += FALLBACK_TILE_SIZE) {
             int y2 = y1 + FALLBACK_TILE_SIZE;
@@ -780,6 +1079,8 @@ static void display_hook(rfbClientPtr client) {
     if (client->supportsH264Encoding) {
         client->tightQualityLevel = -1;
         client->turboQualityLevel = -1;
+    } else {
+        adapt_client_jpeg(client, state);
     }
 
     pthread_mutex_lock(&screen_ready_mutex);
@@ -834,9 +1135,11 @@ static void display_finished_hook(rfbClientPtr client, int result) {
 }
 
 static void count_client_modes(int *h264_clients, int *standard_clients,
+                               int *copyrect_clients,
                                uint64_t *slowest_update_us) {
     *h264_clients = 0;
     *standard_clients = 0;
+    *copyrect_clients = 0;
     *slowest_update_us = 0;
 
     rfbClientIteratorPtr iterator = rfbGetClientIterator(rfb_screen);
@@ -849,6 +1152,9 @@ static void count_client_modes(int *h264_clients, int *standard_clients,
             ++*h264_clients;
         } else {
             ++*standard_clients;
+            if (client->useCopyRect) {
+                ++*copyrect_clients;
+            }
             struct client_state *state = client->clientData;
             if (state) {
                 pthread_mutex_lock(&metrics_mutex);
@@ -872,6 +1178,10 @@ static void handle_signal(int signal_number) {
 int main(int argc, char **argv) {
     const char *scrcpy_host = "127.0.0.1";
     uint16_t scrcpy_port = 27183;
+
+    if (argc == 2 && strcmp(argv[1], "--self-test") == 0) {
+        return run_self_test();
+    }
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -942,6 +1252,7 @@ int main(int argc, char **argv) {
     rfb_screen->h264EncoderCallback = h264_encoder_callback;
     rfb_screen->displayHook = display_hook;
     rfb_screen->displayFinishedHook = display_finished_hook;
+    rfb_screen->deferUpdateTime = 0;
     rfb_screen->ipv6port = -1;
     rfbInitServer(rfb_screen);
     rfbRunEventLoop(rfb_screen, -1, TRUE);
@@ -954,18 +1265,26 @@ int main(int argc, char **argv) {
     int faster_intervals = 0;
     int previous_h264_clients = -1;
     int previous_standard_clients = -1;
+    int previous_copyrect_clients = -1;
+    uint64_t last_copyrect_log_ns = 0;
+    unsigned copyrect_frames_since_log = 0;
+    int last_copyrect_dy = 0;
     while (running && rfbIsActive(rfb_screen)) {
         int h264_clients;
         int standard_clients;
+        int copyrect_clients;
         uint64_t slowest_update_us;
-        count_client_modes(&h264_clients, &standard_clients,
+        count_client_modes(&h264_clients, &standard_clients, &copyrect_clients,
                            &slowest_update_us);
         if (h264_clients != previous_h264_clients
-                || standard_clients != previous_standard_clients) {
-            fprintf(stderr, "active VNC clients: H.264=%d ordinary=%d\n",
-                    h264_clients, standard_clients);
+                || standard_clients != previous_standard_clients
+                || copyrect_clients != previous_copyrect_clients) {
+            fprintf(stderr,
+                    "active VNC clients: H.264=%d ordinary=%d CopyRect=%d\n",
+                    h264_clients, standard_clients, copyrect_clients);
             previous_h264_clients = h264_clients;
             previous_standard_clients = standard_clients;
+            previous_copyrect_clients = copyrect_clients;
         }
 
         int requested_fallback = standard_clients > 0;
@@ -1027,10 +1346,25 @@ int main(int argc, char **argv) {
                        >= publish_interval_ns)) {
             int full_screen;
             int consumed;
+            int copyrect_dy;
             size_t rect_count = publish_latest_fallback_frame(
-                    damage_rects, damage_rect_capacity, &full_screen, &consumed);
+                    damage_rects, damage_rect_capacity, copyrect_clients > 0,
+                    &copyrect_dy, &full_screen, &consumed);
             if (consumed) {
                 last_fallback_publish_ns = monotonic_ns();
+                if (copyrect_dy) {
+                    ++copyrect_frames_since_log;
+                    last_copyrect_dy = copyrect_dy;
+                    if (!last_copyrect_log_ns
+                            || last_fallback_publish_ns - last_copyrect_log_ns
+                               >= UINT64_C(2000000000)) {
+                        fprintf(stderr,
+                                "ordinary VNC CopyRect: %u scroll frames, last dy=%d\n",
+                                copyrect_frames_since_log, last_copyrect_dy);
+                        copyrect_frames_since_log = 0;
+                        last_copyrect_log_ns = last_fallback_publish_ns;
+                    }
+                }
                 if (full_screen) {
                     rfbMarkRectAsModified(rfb_screen, 0, 0,
                                           video_width, video_height);

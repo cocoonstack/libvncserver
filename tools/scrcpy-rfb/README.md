@@ -17,6 +17,19 @@ scrcpy 4.1 to one RFB/VNC port.
   damage against the current framebuffer instead of queueing stale video
   frames, and publication adapts between 60, 30, and 20 FPS using the slowest
   ordinary client's measured update time.
+- The bridge disables LibVNCServer's default 5 ms update defer because decoded
+  frames are already coalesced. Each client socket is capped to a 256 KiB send
+  buffer and, on Linux, a 64 KiB `TCP_NOTSENT_LOWAT`, so a slow connection
+  applies backpressure instead of building a long queue of visually stale
+  updates.
+- Ordinary Tight clients that request JPEG adapt between Q92, Q86, and Q80 from
+  measured encode-and-send time, never exceeding the client's requested
+  quality. Tight compression level 1 minimizes server-side latency; clients
+  that do not request JPEG retain lossless Tight behavior.
+- A high-confidence luma matcher recognizes vertical Android scrolling and
+  emits RFB CopyRect for clients that advertise it. The normal tile comparison
+  runs afterward, repairing exposed rows, fixed app bars, or a false match and
+  providing the normal pixel fallback to clients without CopyRect.
 - Framebuffer publication uses a writer lock while ordinary client encoders use
   shared reader locks. Multiple ordinary clients can encode the same stable
   frame concurrently without observing a black or partially replaced frame.
@@ -57,3 +70,17 @@ desktop-size extensions on this path and exposes the fixed scrcpy size from
 ServerInit. A client that advertises H.264 but selects Tight is given lossless
 Tight, avoiding JPEG ABI problems in specialized H.264 viewer builds; regular
 VNC clients retain performant Tight/JPEG.
+
+Apache Guacamole does not include Tight in its default VNC encoding list. For
+the optimized ordinary path, configure the connection with:
+
+```text
+encodings: tight copyrect zrle hextile raw
+compress-level: 1
+quality-level: 8
+disable-display-resize: true
+```
+
+Quality level 8 initially maps to Q92; the server may lower it to Q86 or Q80
+when that client's send time shows backpressure. ZRLE and Raw remain available
+as maximum-compatibility fallbacks.

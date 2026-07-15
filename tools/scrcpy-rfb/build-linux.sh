@@ -80,6 +80,7 @@ cc \
   -lm \
   -o "/src/dist/${artifact}"
 
+"/src/dist/${artifact}" --self-test
 strip "/src/dist/${artifact}"
 file "/src/dist/${artifact}"
 (
