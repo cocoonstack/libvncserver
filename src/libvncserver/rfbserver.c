@@ -2124,7 +2124,7 @@ rfbSendExtendedClipboardCapability(rfbClientPtr cl) {
     char buf[16] = {
         0x03, 0x00, 0x00, 0x00,
         0xFF, 0xFF, 0xFF, 0xF8, /* -8 */
-        0x17, 0x00, 0x00, 0x01, /* text, request, peek, provide */
+        0x1F, 0x00, 0x00, 0x01, /* text, request, peek, notify, provide */
         0x00, 0x10, 0x00, 0x00, /* max size is 1MiB */
     };
     if (rfbWriteExact(cl, buf, sizeof(buf)) < 0) {
@@ -2148,6 +2148,25 @@ rfbSendExtendedClipboardNotify(rfbClientPtr cl) {
         rfbCloseClient(cl);
         return FALSE;
     }
+    rfbStatRecordMessageSent(cl, rfbServerCutText, sizeof(buf), sizeof(buf));
+    return TRUE;
+}
+
+static rfbBool
+rfbSendExtendedClipboardRequest(rfbClientPtr cl) {
+    char buf[12] = {
+        0x03, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFC, /* -4 */
+        0x02, 0x00, 0x00, 0x01, /* request text */
+    };
+    LOCK(cl->sendMutex);
+    if (rfbWriteExact(cl, buf, sizeof(buf)) < 0) {
+        rfbLogPerror("rfbSendExtendedClipboardRequest: write");
+        rfbCloseClient(cl);
+        UNLOCK(cl->sendMutex);
+        return FALSE;
+    }
+    UNLOCK(cl->sendMutex);
     rfbStatRecordMessageSent(cl, rfbServerCutText, sizeof(buf), sizeof(buf));
     return TRUE;
 }
@@ -2996,7 +3015,17 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
                     return;
                 }
             }
+        } else if (extClipboardFlags & rfbExtendedClipboard_Notify) {
+            cl->extClipboardRequested = FALSE;
+            if (extClipboardFlags & rfbExtendedClipboard_Text) {
+                if (!rfbSendExtendedClipboardRequest(cl)) {
+                    free(str);
+                    return;
+                }
+                cl->extClipboardRequested = TRUE;
+            }
         } else if (extClipboardFlags & rfbExtendedClipboard_Provide) {
+            cl->extClipboardRequested = FALSE;
             if (!rfbProcessExtendedServerCutTextData(cl, extClipboardFlags, str + 4, msg.cct.length - 4)) {
                 free(str);
                 return;
