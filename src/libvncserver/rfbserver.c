@@ -2248,7 +2248,7 @@ rfbProcessExtendedServerCutTextData(rfbClientPtr cl, uint32_t flags, const char 
         stream.avail_out = 4;
         stream.next_out = (unsigned char *)&size;
         int err = inflate(&stream, Z_NO_FLUSH);
-        if (err != Z_OK) {
+        if (err != Z_OK || stream.avail_out != 0) {
             rfbLogPerror("rfbProcessExtendedServerCutTextData: zlib inflation error");
             if (buf != NULL) {
                 free(buf);
@@ -2278,7 +2278,7 @@ rfbProcessExtendedServerCutTextData(rfbClientPtr cl, uint32_t flags, const char 
         stream.avail_out = size;
         stream.next_out = (unsigned char *)buf;
         err = inflate(&stream, Z_NO_FLUSH);
-        if (err != Z_OK && err != Z_STREAM_END) {
+        if ((err != Z_OK && err != Z_STREAM_END) || stream.avail_out != 0) {
             rfbLogPerror("rfbProcessExtendedServerCutTextData: zlib inflation error");
             free(buf);
             inflateEnd(&stream);
@@ -3000,20 +3000,28 @@ rfbProcessClientNormalMessage(rfbClientPtr cl)
             free(str);
             return;
         } else if (extClipboardFlags & rfbExtendedClipboard_Request) {
+            rfbBool sent = TRUE;
+            LOCK(cl->sendMutex);
             if ((cl->extClipboardUserCap & rfbExtendedClipboard_Provide) &&
                 cl->extClipboardData != NULL && cl->extClipboardDataSize > 0) {
-                if (!rfbSendExtendedServerCutTextData(cl, cl->extClipboardData, cl->extClipboardDataSize)) {
-                    free(str);
-                    return;
-                }
+                sent = rfbSendExtendedServerCutTextData(cl, cl->extClipboardData, cl->extClipboardDataSize);
+            }
+            UNLOCK(cl->sendMutex);
+            if (!sent) {
+                free(str);
+                return;
             }
         } else if (extClipboardFlags & rfbExtendedClipboard_Peek) {
+            rfbBool sent = TRUE;
+            LOCK(cl->sendMutex);
             if ((cl->extClipboardUserCap & rfbExtendedClipboard_Notify) &&
                 cl->extClipboardData != NULL && cl->extClipboardDataSize > 0) {
-                if (!rfbSendExtendedClipboardNotify(cl)) {
-                    free(str);
-                    return;
-                }
+                sent = rfbSendExtendedClipboardNotify(cl);
+            }
+            UNLOCK(cl->sendMutex);
+            if (!sent) {
+                free(str);
+                return;
             }
         } else if (extClipboardFlags & rfbExtendedClipboard_Notify) {
             cl->extClipboardRequested = FALSE;
